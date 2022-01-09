@@ -1,4 +1,4 @@
-# Risk of Rain+ (RORPlus)
+# Risk of Rain 2+ (RORPlus)
 
 Implements improvements for Risk of Rain 2.
 
