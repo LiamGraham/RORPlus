@@ -1,103 +1,172 @@
-﻿using System;
-using System.Linq;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using RoR2;
 using UnityEngine;
 using UnityEngine.Networking;
+using R2API.Networking;
+using R2API.Networking.Interfaces;
+
+#nullable enable
 
 namespace RORPlus
 {
     internal class ReviveManager
     {
 
-        Dictionary<NetworkInstanceId, ReviveData> _reviveDataLookup;
+        static Dictionary<NetworkInstanceId, ReviveData> _reviveDataLookup = new();
 
-        public ReviveManager()
-        {
-            _reviveDataLookup = new();
-        }
-
-        public void RegisterHooks()
+        public static void RegisterHooks()
         {
             On.RoR2.GlobalEventManager.OnPlayerCharacterDeath += OnPlayerCharacterDeath;
             On.RoR2.Run.AdvanceStage += OnAdvanceStage;
             On.RoR2.Run.BeginGameOver += OnBeginGameOver;
+            On.RoR2.Run.OnUserRemoved += OnUserRemoved; 
         }
 
-        private void OnBeginGameOver(On.RoR2.Run.orig_BeginGameOver orig, Run self, GameEndingDef gameEndingDef)
+        private static void OnBeginGameOver(On.RoR2.Run.orig_BeginGameOver orig, Run self, GameEndingDef gameEndingDef)
         {
             Reset();
             orig(self, gameEndingDef);
         }
 
-        private void OnAdvanceStage(On.RoR2.Run.orig_AdvanceStage orig, Run self, SceneDef nextScene)
+        private static void OnAdvanceStage(On.RoR2.Run.orig_AdvanceStage orig, Run self, SceneDef nextScene)
         {
             Reset();
             orig(self, nextScene);
         }
 
-        private void OnPlayerCharacterDeath(On.RoR2.GlobalEventManager.orig_OnPlayerCharacterDeath orig, GlobalEventManager self, DamageReport damageReport, NetworkUser victimNetworkUser)
+        private static void OnPlayerCharacterDeath(On.RoR2.GlobalEventManager.orig_OnPlayerCharacterDeath orig, GlobalEventManager self, DamageReport damageReport, NetworkUser victimNetworkUser)
         {
-            Debug.Log($"{victimNetworkUser.netId} died to {damageReport.attacker} at {victimNetworkUser.GetCurrentBody().corePosition}");
-            
             _reviveDataLookup.Add(victimNetworkUser.netId, new ReviveData(victimNetworkUser.netId, victimNetworkUser.GetCurrentBody().corePosition));
+
+            RLogger.LogInfo($"{N(victimNetworkUser)} died to {damageReport.attacker} at {victimNetworkUser.GetCurrentBody().corePosition}");
+            RLogger.LogInfo($"DeathDataLookup: {string.Join("; ", _reviveDataLookup)}");
+
             orig(self, damageReport, victimNetworkUser);
         }
 
-        private void Reset()
+        private static void OnUserRemoved(On.RoR2.Run.orig_OnUserRemoved orig, Run self, NetworkUser user)
+        {
+            _reviveDataLookup.Remove(user.netId);
+            orig(self, user);
+        }
+
+        private static void Reset()
         {
             _reviveDataLookup.Clear();
         }
 
-        public void AttemptRevive(PlayerCharacterMasterController reviver)
+        public static void SendPerfomReviveMessage(NetworkUser reviver)
         {
-            NetworkInstanceId reviverNetId = reviver.networkUser.netId;
-            CharacterBody reviverBody = reviver.master.GetBody();
-            
-            if (IsPlayerDead(reviver))
+            RLogger.LogInfo($"Sending PerformReviveMessage from {N(reviver)}");
+            PerformReviveMessage message = new(reviver);
+            message.Send(NetworkDestination.Server);
+        }
+        
+        public static void AttemptRevive(NetworkInstanceId reviverNetId, Vector3 reviverPosition)
+        {
+            if (!NetworkServer.active)
             {
-                Debug.Log($"[ReviveManager] {reviverNetId} cannot perform revive as player is dead");
+                RLogger.LogError("Non-host machine cannot perform revive. Aborting");
                 return;
             }
 
-            if (reviverBody != null)
+            NetworkUser? reviver = ResolveNetworkUserFromNetworkId(reviverNetId);
+            
+            if (reviver == null)
             {
-                Debug.Log($"[ReviveManager] {reviverNetId} attempting to initiate revive at {reviver.master.GetBody().corePosition}");
-            } else
-            {
-                Debug.LogError($"[ReviveManager] {reviverNetId} does not have body");
+                RLogger.LogError($"Could not resolve reviver from NetId={reviverNetId}");
                 return;
             }
+
+            CharacterMaster reviverMaster = reviver.master;
+
+            if (reviverMaster.IsDeadAndOutOfLivesServer())
+            {
+                RLogger.LogInfo($"{N(reviver)} cannot perform revive as player is dead");
+                return;
+            }
+
+            RLogger.LogInfo($"{N(reviver)} attempting to initiate revive at {reviverPosition}");
 
             if (_reviveDataLookup.Count == 0)
             {
-                Debug.Log("[ReviveManager] No players to revive");
+                RLogger.LogInfo("No players to revive");
                 return;
             } else
             {
-                Debug.Log($"[ReviveManager] DeathDataLookup: {string.Join("; ", _reviveDataLookup)}");
+                RLogger.LogInfo($"DeathDataLookup: {string.Join("; ", _reviveDataLookup)}");
             }
 
-            List<NetworkInstanceId> revivalCandidates = new();
-            foreach (KeyValuePair<NetworkInstanceId, ReviveData> entry in _reviveDataLookup)
+            List<ReviveData> revivalCandidates = GetRevivalCandidates(reviver, reviverPosition);
+            if (revivalCandidates.Count == 0)
             {
-                Debug.Log($"[ReviveManager] Checking revive eligibility of {entry.Key}");
-                if (!entry.Value.CanRevive(reviver))
-                {
-                    Debug.Log($"[ReviveManager] {entry.Key} cannot be revived by {reviverNetId}");
-                    continue;
-                }
-                
-                Debug.Log($"[ReviveManager] {entry.Key} can be revived by {reviverNetId}");
-                revivalCandidates.Add(entry.Key);
+                RLogger.LogInfo($"No players are eligible for revival by {N(reviver)}");
+                return;
+            }
+            ReviveData target = SelectTargetFromRevivalCandidates(revivalCandidates);
+            bool success = PerformRevive(target);
+
+            if (success)
+            {
+                _reviveDataLookup.Remove(target.NetId);
             }
         }
-
-        private bool IsPlayerDead(PlayerCharacterMasterController player)
+        
+        // Returns a list of ReviveData instances corresponding to the players which are eligibile to be revived by the given player.
+        private static List<ReviveData> GetRevivalCandidates(NetworkUser reviverNetUser, Vector3 reviverPosition)
         {
-            CharacterBody body = player.master.GetBody();
+            List<ReviveData> revivalCandidates = new();
+            foreach (KeyValuePair<NetworkInstanceId, ReviveData> entry in _reviveDataLookup)
+            {
+                RLogger.LogInfo($"Checking revive eligibility of {entry.Key}");
+                if (!entry.Value.CanRevive(reviverPosition))
+                {
+                    RLogger.LogInfo($"{entry.Key} cannot be revived by {N(reviverNetUser)}");
+                    continue;
+                }
 
-            return (body != null && !body.healthComponent.alive) || player.master.IsDeadAndOutOfLivesServer();
+                RLogger.LogInfo($"{entry.Key} can be revived by {N(reviverNetUser)}");
+                revivalCandidates.Add(entry.Value);
+            }
+            return revivalCandidates;
+        }
+
+        private static ReviveData SelectTargetFromRevivalCandidates(List<ReviveData> revivalCandidates)
+        {
+            // TODO Select target based on proximity to reviver and/or other criteria (e.g. first downed)
+            return revivalCandidates[0];
+        }
+
+        // Revives player corresponding to given ReviveData instance, and returns true if revive is successful. Otherwise, returns false.
+        private static bool PerformRevive(ReviveData reviveData)
+        {
+            NetworkUser? networkUser = ResolveNetworkUserFromNetworkId(reviveData.NetId);
+            if (networkUser == null)
+            {
+                RLogger.LogInfo($"NetworkUser with NetId={reviveData.NetId} could not be found");
+                return false;
+            }
+
+            RLogger.LogInfo($"Revived {N(networkUser)}");
+            networkUser.master.RespawnExtraLife();
+            
+            return true; 
+        }
+
+        private static NetworkUser? ResolveNetworkUserFromNetworkId(NetworkInstanceId netId)
+        {
+            GameObject gameObject = Util.FindNetworkObject(netId);
+            if (!gameObject)
+            {
+                return null;
+            }
+            
+            return gameObject.GetComponent<NetworkUser>();
+        }
+
+        private static string N(NetworkUser user)
+        {
+            return $"{user.userName} (NetId={user.netId})";
         }
     }
 }

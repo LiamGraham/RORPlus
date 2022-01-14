@@ -4,6 +4,7 @@ using System.Text;
 using UnityEngine;
 using UnityEngine.Networking;
 using RoR2;
+using R2API.Networking;
 
 namespace RORPlus
 {
@@ -29,11 +30,10 @@ namespace RORPlus
             get => _netId;
         }
 
-        public bool CanRevive(PlayerCharacterMasterController reviver)
+        public bool CanRevive(Vector3 reviverPosition)
         {
-            Vector3 reviverPosition = reviver.master.GetBody().corePosition;
             float distanceToTarget = Vector3.Distance(reviverPosition, _revivePosition);
-            Debug.Log($"Distance to revive target: {distanceToTarget}");
+            RLogger.LogInfo($"Distance to revive target: {distanceToTarget}");
             
             return distanceToTarget <= ConfigManager.ReviveRange.Value;
         }
